@@ -29,7 +29,9 @@ Subcommands
     cells     list RAMB cells of a yosys JSON with their init digest
     halves    list RAMB18 halves of a FASM file with their init digest
     identify  match cells against FASM halves
-    update    splice new init bits into a routed FASM
+    learn     check the block RAM layout model against a routed design
+    patch     update memories from hex files, with no yosys run
+    update    splice new init bits into a routed FASM from a new yosys JSON
     check     rewrite a FASM file unchanged (parser round-trip test)
 
 Bit order: a yosys parameter INIT_xx is 256 bits, LSB first from the JSON string.
@@ -342,6 +344,135 @@ class Design:
 
 
 # ---------------------------------------------------------------------------
+# Block RAM contents without yosys
+#
+# memory_libmap fills a RAMB cell one bit plane at a time: column k of a cell
+# holds plane 9*cell + k, where a plane is one bit of the word across a whole
+# block of addresses.  Blocks are sized by the cell depth, so the plane stream is
+# cut every nine planes and a cell can straddle two blocks.  That is why some
+# cells hold bits 27..31 of one address block followed by bits 0..3 of the next,
+# which no single (address, bit) slice can describe.
+#
+# Inside a cell, verified against yosys output bit for bit:
+#   INIT_{xx}[i*8 + j] = row (xx*32 + i), column j        j = 0..7
+#   INITP_{yy}[i]      = row (yy*256 + i), column 8
+#
+# Source: passes/memory/memory_libmap.cc (init loop), techlibs/xilinx/
+# brams_xc4v.txt (ram description) and brams_defs.vh (slice_init/slice_initp).
+# ---------------------------------------------------------------------------
+
+CELL_ROWS = {"RAMB18": 2048, "RAMB36": 4096}
+PLANES_PER_CELL = 9
+
+
+def ram_rows(cell_type):
+    for family, rows in CELL_ROWS.items():
+        if cell_type.startswith(family):
+            return rows
+    raise XcbrupError(f"unsupported RAMB type {cell_type}")
+
+
+def memory_planes(width, depth, rows):
+    """One plane per (address block, bit)."""
+    return -(-depth // rows) * width
+
+
+def memory_cells(width, depth, rows):
+    return -(-memory_planes(width, depth, rows) // PLANES_PER_CELL)
+
+
+def read_hex(path):
+    words = []
+    try:
+        with open(path, "r") as handle:
+            for line in handle:
+                text = line.strip()
+                if text:
+                    words.append(int(text, 16))
+    except OSError as error:
+        raise XcbrupError(f"cannot read {path}: {error}") from error
+    except ValueError as error:
+        raise XcbrupError(f"{path} is not a hex file: {error}") from error
+    if not words:
+        raise XcbrupError(f"{path} is empty")
+    return words
+
+
+def hex_width(words):
+    return max(1, max(word.bit_length() for word in words))
+
+
+def encode_cell(index, width, depth, words, rows):
+    """INIT/INITP parameters for one cell, filled from the memory contents."""
+    n_init = rows // 32
+    n_initp = rows // 256
+    params = {f"INIT_{i:02X}": [False] * 256 for i in range(n_init)}
+    params.update({f"INITP_{i:02X}": [False] * 256 for i in range(n_initp)})
+
+    plane_count = memory_planes(width, depth, rows)
+    for column in range(PLANES_PER_CELL):
+        plane = index * PLANES_PER_CELL + column
+        if plane >= plane_count:
+            continue
+        block, bit = divmod(plane, width)
+        for row in range(rows):
+            address = block * rows + row
+            if address >= depth:
+                continue
+            value = bool((words[address] >> bit) & 1)
+            if column < 8:
+                params[f"INIT_{row // 32:02X}"][(row % 32) * 8 + column] = value
+            else:
+                params[f"INITP_{row // 256:02X}"][row % 256] = value
+    return params
+
+
+def group_cells(design):
+    """Cells of one memory share the module id: 'mem0.0.3' -> 'mem0'."""
+    groups = {}
+    for cell in design.cells:
+        groups.setdefault(cell.name.split(".")[0], []).append(cell)
+    for cells in groups.values():
+        cells.sort(key=lambda c: int(c.name.rsplit(".", 1)[1]))
+    return groups
+
+
+def parse_mem_specs(values, flag):
+    specs = {}
+    for value in values or []:
+        name, separator, path = value.partition("=")
+        missing_field = not separator or not name or not path
+        if missing_field:
+            raise XcbrupError(f"{flag} takes NAME=FILE, got {value!r}")
+        specs[name] = path
+    return specs
+
+
+def encode_memory(memid, cells, path):
+    """Encode one memory's hex file into per-cell parameters."""
+    words = read_hex(path)
+    depth = len(words)
+    width = hex_width(words)
+    rows = ram_rows(cells[0].ctype)
+    expected = memory_cells(width, depth, rows)
+    cell_count_mismatch = expected != len(cells)
+    if cell_count_mismatch:
+        raise XcbrupError(
+            f"{memid}: {path} is {depth} x {width} bits, which needs {expected} "
+            f"{cells[0].ctype} cells, but the routed design has {len(cells)}")
+    encoded = [encode_cell(i, width, depth, words, rows) for i in range(expected)]
+    return encoded, width, depth, rows
+
+
+def params_disagreement(expected, cell):
+    """Name of the first parameter that differs, or None."""
+    for name, bits in expected.items():
+        if cell.params.get(name, [False] * len(bits)) != bits:
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
 # matching
 
 def identify(design, fasm):
@@ -557,6 +688,89 @@ def cmd_update(args):
     return 0
 
 
+def cmd_learn(args):
+    """Check that the layout model reproduces a routed design's init bits."""
+    design = Design(args.json)
+    groups = group_cells(design)
+    specs = parse_mem_specs(args.mem, "--mem")
+    unequipped = sorted(set(groups) - set(specs))
+    if unequipped:
+        raise XcbrupError(f"no --mem given for {', '.join(unequipped)}")
+
+    failures = 0
+    for memid in sorted(groups):
+        cells = groups[memid]
+        encoded, width, depth, rows = encode_memory(memid, cells, specs[memid])
+        for index, cell in enumerate(cells):
+            bad = params_disagreement(encoded[index], cell)
+            if bad is not None:
+                failures += 1
+                print(f"FAIL {cell.name}: {bad} disagrees with the routed JSON",
+                      file=sys.stderr)
+        print(f"  {memid}: {len(cells)} x {cells[0].ctype}, {depth} x {width} bits, "
+              f"{rows} rows per cell")
+    if failures:
+        raise XcbrupError(f"layout model rejected by {failures} cell(s)")
+    print(f"PASS layout model reproduces every init bit of {len(groups)} memory(s)")
+    return 0
+
+
+def cmd_patch(args):
+    """Rewrite memory contents from hex files, with no yosys run."""
+    fasm = Fasm.load(args.fasm)
+    routed = Design(args.json)
+    groups = group_cells(routed)
+    old_specs = parse_mem_specs(args.mem, "--mem")
+    new_specs = parse_mem_specs(args.new_mem, "--new-mem")
+
+    for memid in sorted(groups):
+        if memid not in old_specs or memid not in new_specs:
+            raise XcbrupError(f"{memid}: needs both --mem and --new-mem")
+        encoded, width, depth, rows = encode_memory(memid, groups[memid], old_specs[memid])
+        for index, cell in enumerate(groups[memid]):
+            bad = params_disagreement(encoded[index], cell)
+            if bad is not None:
+                raise XcbrupError(
+                    f"{cell.name}: {old_specs[memid]} disagrees with the routed "
+                    f"design on {bad}; this hex file is not the one the design was "
+                    "built from, so the layout cannot be trusted")
+
+    matches, ambiguous, unmatched = identify(routed, fasm)
+    if unmatched:
+        for cell, reason in unmatched:
+            print(f"UNMATCHED {cell.name}: {reason}", file=sys.stderr)
+        raise XcbrupError("cannot place every RAMB cell; refusing to patch")
+
+    replacements = {}
+    for memid in sorted(groups):
+        encoded, width, depth, rows = encode_memory(memid, groups[memid], new_specs[memid])
+        for index, cell in enumerate(groups[memid]):
+            replacements[cell.name] = Cell(cell.name, cell.ctype, encoded[index])
+
+    mapping = [(replacements[cell.name], tile, halves) for cell, tile, halves in matches]
+
+    skipped = []
+    for cell, candidates in ambiguous:
+        replacement = replacements[cell.name]
+        halves = [0, 1] if replacement.is36 else [0]
+        has_content = any(any(bits) for half in halves
+                          for bits in replacement.vectors(half).values())
+        if has_content:
+            where = ", ".join(f"{t}.RAMB18_Y{h}" for t, h in candidates[:4])
+            raise XcbrupError(
+                f"cell {cell.name} is ambiguous ({len(candidates)} candidate halves: "
+                f"{where}) and the new contents are not all zero")
+        skipped.append(cell.name)
+
+    apply_update(fasm, None, mapping)
+    fasm.emit(args.output)
+    print(f"patched {len(mapping)} RAMB cells -> {args.output}", file=sys.stderr)
+    if skipped:
+        print(f"skipped {len(skipped)} zero-content cell(s): {', '.join(skipped)}",
+              file=sys.stderr)
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="xcbrup", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -594,6 +808,22 @@ def build_parser():
     p.add_argument("--output", required=True)
     p.add_argument("--cleanup", action="store_true")
     p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("learn",
+                       help="verify the layout model against a routed design")
+    p.add_argument("--json", required=True)
+    p.add_argument("--mem", action="append", metavar="NAME=FILE")
+    p.set_defaults(func=cmd_learn)
+
+    p = sub.add_parser("patch",
+                       help="update memories from hex files, without yosys")
+    p.add_argument("--fasm", required=True)
+    p.add_argument("--json", required=True)
+    p.add_argument("--mem", action="append", metavar="NAME=FILE")
+    p.add_argument("--new-mem", action="append", metavar="NAME=FILE")
+    p.add_argument("--output", required=True)
+    p.set_defaults(func=cmd_patch)
+
     return parser
 
 

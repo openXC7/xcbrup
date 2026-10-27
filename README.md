@@ -205,6 +205,44 @@ Every later firmware change repeats steps 3 to 5. `picosoc-routed.fasm` and
 `picosoc-routed.json` stay untouched, and every new bitstream is derived from
 them.
 
+## Changing memory contents without yosys
+
+The loop in the tutorial re-runs yosys, which is only there to repack a hex file
+into RAMB `INIT_xx` parameters. On a large design that synthesis is the remaining
+wait, and it is avoidable: the repacking is a fixed layout that `xcbrup` can
+reproduce itself.
+
+Instead of a new JSON, hand `patch` a hex file of the new contents:
+
+```bash
+xcbrup learn --json picosoc-routed.json --mem mem=routed.hex
+xcbrup patch --fasm picosoc-routed.fasm --json picosoc-routed.json \
+    --mem mem=routed.hex --new-mem mem=new.hex --output new.fasm
+```
+
+`learn` proves the layout model against the routed design by rebuilding every
+init bit from the hex file and comparing with the JSON. It exits non-zero if a
+single bit disagrees, so a design whose layout is not understood is rejected
+rather than patched on a guess. `patch` runs the same check before writing.
+
+The model, in case you need to trust it:
+
+* a plane is one bit of the word across a block of addresses, and blocks are
+  sized by the cell depth (2048 addresses for a RAMB18, 4096 for a RAMB36);
+* each RAMB cell holds nine consecutive planes as its nine columns, so a cell can
+  straddle two address blocks and mix two bit ranges in one row;
+* inside a cell, `INIT_xx[i*8+j]` is data bit `j` of row `xx*32+i`, and
+  `INITP_yy[i]` is bit 8 of row `yy*256+i`.
+
+`--mem NAME=FILE` takes the contents the routed design was built from, so the
+argument is `NAME`, the module id yosys gave the memory: `mem0.0.3` belongs to
+`mem0`. Use `xcbrup learn` first; if it passes, both hex files are interchangeable
+with the JSON path.
+
+Verified on the `bramtest` design: hex-only patching produces a FASM byte
+identical to the yosys path, which is byte identical to a full nextpnr route of
+the same contents.
+
 ## Commands
 
 ### `genpat`
@@ -277,6 +315,35 @@ Ambiguous cells whose new contents *are* all zero are skipped and listed. Writin
 zeros over zeros changes nothing, so nothing is at risk. Runtime RAMs that start
 zero fall into this category and do not need addressing.
 
+### `learn`
+
+Check that the block RAM layout model reproduces a routed design's init bits.
+Reads the hex files the design was built from and compares, bit for bit, against
+the JSON the router saw.
+
+```bash
+xcbrup learn --json design.json --mem mem0=mem0.hex --mem mem36=mem36.hex
+```
+
+```text
+  mem0: 15 x RAMB18E1, 8192 x 32 bits, 2048 rows per cell
+  mem36: 2 x RAMB36E1, 4096 x 18 bits, 4096 rows per cell
+PASS layout model reproduces every init bit of 2 memory(s)
+```
+
+### `patch`
+
+Rewrite memories in a routed FASM from hex files, with no synthesis.
+
+```bash
+xcbrup patch --fasm design.fasm --json design.json \
+    --mem mem0=old0.hex --new-mem mem0=new0.hex --output new.fasm
+```
+
+Refuses when the layout check fails, when a hex file needs a different number of
+cells than the routed design has, or when a memory cannot be located
+unambiguously.
+
 ### `check`
 
 Rewrite a FASM unchanged. A parser self-test; the output must be byte-identical
@@ -337,6 +404,10 @@ Tested on `xc7s50` (Arty S7) with three designs:
   2 x `RAMB36E1` at width 18 holding 4096 x 18 bits. Both memories are streamed
   over UART and compared word by word against a xorshift32 stream rebuilt from
   the seed, so 335872 memory bits are checked per bitstream.
+
+  The hex-only path was also checked on hardware with a seed that no synthesis run
+  had ever produced. Nothing but the layout model could have put the right values
+  in those bits, and the board read all 335872 of them back correctly.
 
 `bramtest` covers the `RAMB36E1` even/odd half interleave, which is the branch a
 softcore-sized ROM never reaches, and the width-9 parity lanes, which carry data
