@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "note": "Measured, not derived. At width 36 a RAMB18E1 holds 512 addresses of 36 slots but carries only 32 data bits, so the four spare slots of the lower half take the upper half's low four bits and its other 28 bits go to the second cell. Calibrated on demo-projects/picosoc by 10 address probes plus 32 XOR probes; reproduces all 32768 initialised bits. Re-measure if the memory shape or the cell count changes.",
+  "cell_type": "RAMB18E1",
+  "rows": 2048,
+  "depth": 1024,
+  "width": 32,
+  "cells": [
+    {
+      "segments": [
+        {
+          "addr": 0,
+          "bits": 0,
+          "count_addr": 512,
+          "count_bits": 32,
+          "base": 0,
+          "stride": 36
+        },
+        {
+          "addr": 512,
+          "bits": 0,
+          "count_addr": 512,
+          "count_bits": 4,
+          "base": 32,
+          "stride": 36
+        }
+      ]
+    },
+    {
+      "segments": [
+        {
+          "addr": 512,
+          "bits": 4,
+          "count_addr": 512,
+          "count_bits": 28,
+          "base": 0,
+          "stride": 36
+        }
+      ]
+    }
+  ]
+}

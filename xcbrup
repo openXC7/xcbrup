@@ -456,8 +456,88 @@ def parse_mem_specs(values, flag):
     return specs
 
 
-def encode_memory(memid, cells, path):
+def slot_params(rows, slots):
+    """INIT/INITP parameters from {slot: bool}, slot = row * 9 + column."""
+    params = {f"INIT_{i:02X}": [False] * 256 for i in range(rows // 32)}
+    params.update({f"INITP_{i:02X}": [False] * 256 for i in range(rows // 256)})
+    for slot, value in slots.items():
+        row, column = divmod(slot, PLANES_PER_CELL)
+        row_outside_cell = row >= rows
+        if row_outside_cell:
+            raise XcbrupError(f"slot {slot} is outside a {rows}-row cell")
+        if column < 8:
+            params[f"INIT_{row // 32:02X}"][(row % 32) * 8 + column] = value
+        else:
+            params[f"INITP_{row // 256:02X}"][row % 256] = value
+    return params
+
+
+def load_map(path):
+    """Read a calibration map: per-cell segments of (address, bit) -> slot."""
+    try:
+        with open(path, "r") as handle:
+            document = json.load(handle)
+    except OSError as error:
+        raise XcbrupError(f"cannot read {path}: {error}") from error
+    except ValueError as error:
+        raise XcbrupError(f"{path} is not a map file: {error}") from error
+    for key in ("cell_type", "rows", "depth", "width", "cells"):
+        missing_key = key not in document
+        if missing_key:
+            raise XcbrupError(f"{path}: missing {key!r}")
+    document["source"] = path
+    return document
+
+
+def encode_segments(memid, cells, path, mapping):
+    """Encode a hex file through a calibrated map, checking it still fits."""
+    words = read_hex(path)
+    depth = len(words)
+    width = hex_width(words)
+    rows = ram_rows(cells[0].ctype)
+    rows_differ = rows != mapping["rows"]
+    if rows_differ:
+        raise XcbrupError(
+            f"{memid}: map {mapping['source']} describes {mapping['rows']}-row "
+            f"cells, but the design uses {rows}-row {cells[0].ctype}")
+    shape_differs = depth != mapping["depth"] or width > mapping["width"]
+    if shape_differs:
+        raise XcbrupError(
+            f"{memid}: {path} is {depth} x {width} bits, but map {mapping['source']} "
+            f"was calibrated for {mapping['depth']} x {mapping['width']} bits")
+    cell_count_differs = len(cells) != len(mapping["cells"])
+    if cell_count_differs:
+        raise XcbrupError(
+            f"{memid}: map names {len(mapping['cells'])} cells, design has {len(cells)}")
+
+    encoded = []
+    for index, cell in enumerate(cells):
+        slots = {}
+        for segment in mapping["cells"][index]["segments"]:
+            for step in range(segment["count_addr"]):
+                address = segment["addr"] + step
+                address_outside = address >= depth
+                if address_outside:
+                    continue
+                word = words[address]
+                for offset in range(segment["count_bits"]):
+                    bit = segment["bits"] + offset
+                    slot = segment["base"] + step * segment["stride"] + offset
+                    value = bool((word >> bit) & 1)
+                    previous = slots.setdefault(slot, value)
+                    conflicting = previous != value
+                    if conflicting:
+                        raise XcbrupError(
+                            f"{cell.name}: map assigns slot {slot} to two different "
+                            "bits; the map is inconsistent")
+        encoded.append(slot_params(rows, slots))
+    return encoded, width, depth, rows
+
+
+def encode_memory(memid, cells, path, mapping=None):
     """Encode one memory's hex file into per-cell parameters."""
+    if mapping is not None:
+        return encode_segments(memid, cells, path, mapping)
     words = read_hex(path)
     depth = len(words)
     width = hex_width(words)
@@ -465,9 +545,13 @@ def encode_memory(memid, cells, path):
     expected = memory_cells(width, depth, rows)
     cell_count_mismatch = expected != len(cells)
     if cell_count_mismatch:
+        wider_than_plane_model = width > 18
+        hint = ("\n  a memory inferred at a width above 18 bits does not follow "
+                "the plane model; calibrate a map and pass --map (see README)"
+                if wider_than_plane_model else "")
         raise XcbrupError(
             f"{memid}: {path} is {depth} x {width} bits, which needs {expected} "
-            f"{cells[0].ctype} cells, but the routed design has {len(cells)}")
+            f"{cells[0].ctype} cells, but the routed design has {len(cells)}{hint}")
     encoded = [encode_cell(i, width, depth, words, rows) for i in range(expected)]
     return encoded, width, depth, rows
 
@@ -718,7 +802,9 @@ def cmd_learn(args):
         print(f"  {memid}: {len(cells)} x {cells[0].ctype}, {depth} x {width} bits, "
               f"{rows} rows per cell")
     if failures:
-        raise XcbrupError(f"layout model rejected by {failures} cell(s)")
+        raise XcbrupError(
+            f"layout model rejected by {failures} cell(s); if the memory is "
+            "inferred wider than 18 bits, calibrate a map and use 'patch --map'")
     print(f"PASS layout model reproduces every init bit of {len(groups)} memory(s)")
     return 0
 
@@ -730,18 +816,20 @@ def cmd_patch(args):
     groups = group_cells(routed)
     old_specs = parse_mem_specs(args.mem, "--mem")
     new_specs = parse_mem_specs(args.new_mem, "--new-mem")
+    mapfile = load_map(args.map) if args.map else None
 
     for memid in sorted(groups):
         if memid not in old_specs or memid not in new_specs:
             raise XcbrupError(f"{memid}: needs both --mem and --new-mem")
-        encoded, width, depth, rows = encode_memory(memid, groups[memid], old_specs[memid])
+        encoded, width, depth, rows = encode_memory(
+            memid, groups[memid], old_specs[memid], mapfile)
         for index, cell in enumerate(groups[memid]):
             bad = params_disagreement(encoded[index], cell)
             if bad is not None:
                 raise XcbrupError(
                     f"{cell.name}: {old_specs[memid]} disagrees with the routed "
-                    f"design on {bad}; this hex file is not the one the design was "
-                    "built from, so the layout cannot be trusted")
+                    f"design on {bad}; this hex file, or the map in use, does not "
+                    "match the design, so the layout cannot be trusted")
 
     matches, ambiguous, unmatched = identify(routed, fasm)
     if unmatched:
@@ -751,7 +839,8 @@ def cmd_patch(args):
 
     replacements = {}
     for memid in sorted(groups):
-        encoded, width, depth, rows = encode_memory(memid, groups[memid], new_specs[memid])
+        encoded, width, depth, rows = encode_memory(
+            memid, groups[memid], new_specs[memid], mapfile)
         for index, cell in enumerate(groups[memid]):
             replacements[cell.name] = Cell(cell.name, cell.ctype, encoded[index])
 
@@ -829,6 +918,9 @@ def build_parser():
     p.add_argument("--json", required=True)
     p.add_argument("--mem", action="append", metavar="NAME=FILE")
     p.add_argument("--new-mem", action="append", metavar="NAME=FILE")
+    p.add_argument("--map",
+                   help="calibrated map for geometries the plane model cannot "
+                        "describe (e.g. width 36); verified against --json first")
     p.add_argument("--output", required=True)
     p.set_defaults(func=cmd_patch)
 
