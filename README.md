@@ -146,16 +146,60 @@ and turn `P` (0x50) into `Z` (0x5A), keeping the bytes in the same order:
 mem['h02B3] <= 32'h7365725A;
 ```
 
-### 4. Rebuild only what is needed
+### 4. Produce the new memory contents
 
-Synthesis, no routing:
+**picosoc needs a synthesis run here**, and the reason is worth knowing. Its
+`progmem` is inferred at a 36-bit port width, and the hex-only path below
+currently reproduces only the narrower packing. `xcbrup learn` says so instead of
+risking a wrong map:
+
+```text
+xcbrup: soc.progmem.mem: progmem.hex is 1024 x 32 bits, which needs 4 RAMB18E1
+cells, but the routed design has 2
+```
+
+So, for this design: synthesis, no routing.
 
 ```bash
 yosys -p "synth_xilinx -flatten -abc9 -arch xc7 -top top; write_json new.json" \
       arty_s7.v picosoc_noflash.v picorv32.v progmem.v simpleuart.v
 ```
 
-Check that `xcbrup` can find the memory in the routed design:
+### 4b. Or skip synthesis, where the layout is understood
+
+When `learn` passes, no synthesis is needed at all. Run it once per routed
+design; it rebuilds every init bit from the hex file and compares against the
+JSON the router saw, so it also tells you which of the two paths you are on.
+
+`demo-projects/bramtest` is such a design, and both of its memories are
+verified:
+
+```bash
+xcbrup learn --json bramtest-routed.json \
+    --mem mem0=bramtest.hex --mem mem36=bramtest36.hex
+```
+
+```text
+  mem0: 15 x RAMB18E1, 8192 x 32 bits, 2048 rows per cell
+  mem36: 2 x RAMB36E1, 4096 x 18 bits, 4096 rows per cell
+PASS layout model reproduces every init bit of 2 memory(s)
+```
+
+Then patching is hex in, FASM out:
+
+```bash
+xcbrup patch --fasm bramtest-routed.fasm --json bramtest-routed.json \
+    --mem mem0=bramtest.hex --mem mem36=bramtest36.hex \
+    --new-mem mem0=new0.hex --new-mem mem36=new36.hex --output new.fasm
+```
+
+The `NAME` in `--mem NAME=FILE` is the memory's hierarchical name, which is the
+cell name minus the last two components: `soc.progmem.mem.0.1` belongs to
+`soc.progmem.mem`, `mem0.0.3` belongs to `mem0`.
+
+### 5. Locate, assemble, flash
+
+Worth doing once: confirm the memory can be found in the routed design.
 
 ```bash
 xcbrup identify --fasm picosoc-routed.fasm --json picosoc-routed.json
@@ -168,9 +212,9 @@ soc.progmem.mem.0.1 -> BRAM_L_X6Y95.RAMB18_Y1
 ```
 
 Both halves of the program landed in one tile. Your tile coordinates will differ;
-with the current toolchain the placer picks its own.
+the placer picks its own.
 
-### 5. Patch and assemble
+Either path ends the same way:
 
 ```bash
 xcbrup update \
@@ -187,23 +231,25 @@ openFPGALoader --cable digilent --bitstream new.bit
 
 Serial output now says `Zress ENTER to continue...`.
 
-That is the whole loop. From editing firmware to a running board:
+From editing firmware to a running board:
 
-| step | time |
-| --- | --- |
-| yosys | ~11 s |
-| `xcbrup update` | ~0.3 s |
-| `fpga-as` | ~0.4 s |
-| flash | ~3 s |
+| step | time | path |
+| --- | --- | --- |
+| yosys | ~11 s | 4a only |
+| `xcbrup update` | ~0.3 s | 4a |
+| `xcbrup patch` | ~0.3 s | 4b |
+| `fpga-as` | ~0.4 s | both |
+| flash | ~3 s | both |
 
-Place and route is gone. The saving grows with design size, since routing cost
-scales badly while patching cost stays proportional to the size of the FASM file.
+Place and route is gone either way, and on path 4b so is synthesis. The saving
+grows with design size, since routing and synthesis both scale with the design
+while patching scales with the size of the FASM file.
 
 ### 6. Repeat
 
-Every later firmware change repeats steps 3 to 5. `picosoc-routed.fasm` and
-`picosoc-routed.json` stay untouched, and every new bitstream is derived from
-them.
+Every later firmware change repeats step 3, then step 4, then step 5.
+`picosoc-routed.fasm` and `picosoc-routed.json` stay untouched, and every new
+bitstream derives from them.
 
 ## Changing memory contents without yosys
 
@@ -242,6 +288,12 @@ with the JSON path.
 Verified on the `bramtest` design: hex-only patching produces a FASM byte
 identical to the yosys path, which is byte identical to a full nextpnr route of
 the same contents.
+
+Where it does not apply yet: libmap picks a port width per memory, and this model
+reproduces the packing for the narrow options. A memory inferred at width 36 —
+`demo-projects/picosoc` is one — needs more cells than the model predicts, and
+`learn` reports the mismatch instead of patching. Those designs use the `update`
+path with a yosys JSON until the width-36 option is ported too.
 
 ## Commands
 

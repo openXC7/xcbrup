@@ -428,10 +428,18 @@ def encode_cell(index, width, depth, words, rows):
 
 
 def group_cells(design):
-    """Cells of one memory share the module id: 'mem0.0.3' -> 'mem0'."""
+    """Cells of one memory share the module id.
+
+    memory_libmap names each cell '{memid}.{repl}.{data}', and memid is the
+    hierarchical memory name, so drop exactly two components:
+    'soc.progmem.mem.0.1' -> 'soc.progmem.mem', 'mem0.0.3' -> 'mem0'.
+    """
     groups = {}
     for cell in design.cells:
-        groups.setdefault(cell.name.split(".")[0], []).append(cell)
+        parts = cell.name.split(".")
+        if len(parts) < 3:
+            raise XcbrupError(f"unexpected RAMB cell name {cell.name!r}")
+        groups.setdefault(".".join(parts[:-2]), []).append(cell)
     for cells in groups.values():
         cells.sort(key=lambda c: int(c.name.rsplit(".", 1)[1]))
     return groups
