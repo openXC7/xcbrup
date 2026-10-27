@@ -238,6 +238,7 @@ From editing firmware to a running board:
 | yosys | ~11 s | 4a only |
 | `xcbrup update` | ~0.3 s | 4a |
 | `xcbrup patch` | ~0.3 s | 4b |
+| `xcbrup fit` | ~0.7 s, once per geometry | 4b |
 | `fpga-as` | ~0.4 s | both |
 | flash | ~3 s | both |
 
@@ -303,27 +304,35 @@ cell .0.1   addr 512..1023  bits 4..31  ->  slot 36*(a-512) + (b-4)
 ```
 
 `slot = row * 9 + column`, and column 8 lives in `INITP`. Because the split
-depends on how many words the initialiser sets, it is measured for the design
-and stored in a map file instead of being derived:
+depends on how many words the initialiser sets, it is fitted for the design and
+stored in a map file rather than derived from `depth` and `width`:
 
 ```bash
+xcbrup fit --json picosoc.json --mem soc.progmem.mem=progmem.hex \
+    --output maps/spartan7-ramb18-w36-1024x32.json
+
 xcbrup patch --fasm picosoc.fasm --json picosoc.json --map maps/spartan7-ramb18-w36-1024x32.json \
     --mem soc.progmem.mem=progmem.hex \
     --new-mem soc.progmem.mem=new.hex --output new.fasm
 ```
 
-A map is a list of per-cell segments of `(address, bit) -> slot`. Maps live in
-`maps/`, named by geometry rather than by design, because the packing depends on
-`cell_type`, `rows`, `depth` and `width` only. `patch` rebuilds the routed
-JSON's parameters through the map before writing anything, and refuses if a bit
-disagrees or if the geometry does not match, so a wrong or stale map cannot
-corrupt a bitstream.
+A map is a list of per-cell segments of `(address, bit) -> slot`. `fit` does not
+synthesise anything: it takes the routed JSON, which holds every init bit, and
+the hex the design was built from, and solves for the few integers that describe
+the packing, since a libmap packing is affine per segment. Picosoc takes 0.7 s.
+The result is only written once it rebuilds the routed parameters bit for bit,
+so a fit that does not fit is refused rather than saved.
 
-`maps/spartan7-ramb18-w36-1024x32.json` was produced by measurement: 10 probes
-that set one address bit at a time give each slot its address, and 32 probes of
-the form `word[a] ^ (1 << j)` give it its data bit. The XOR keeps the contents
-as varied as the firmware, so yosys never folds the RAM away. 43 synthesis runs,
-verified by rebuilding all 32,768 initialised bits, then never again.
+`patch` repeats that check before writing anything, and refuses if a bit
+disagrees, if the geometry does not match, or if the map was fitted for another
+memory. A wrong or stale map cannot corrupt a bitstream.
+
+Maps live in `maps/`, named by geometry rather than by design. The committed
+`spartan7-ramb18-w36-1024x32.json` was also derived independently by 43
+synthesis probes — 10 setting one address bit at a time, 32 of the form
+`word[a] ^ (1 << j)` — and the two derivations agree on all 32,768 bits. The
+fitting path is the one to use: it needs no toolchain beyond the files a build
+already produced.
 
 The map holds while the memory shape does. `progmem` therefore reads a
 fixed-size hex file with `$readmemh`: an `initial` block whose length follows
@@ -379,7 +388,8 @@ Match cells to FASM halves and report the mapping.
 xcbrup identify --fasm design.fasm --json design.json [--map map.json]
 ```
 
-Exits non-zero if any cell is unmatched or ambiguous.
+Exits non-zero if any cell is unmatched or ambiguous. `--map` here writes the
+cell-to-tile placement that was found; it is not the memory map `patch` takes.
 
 ### `update`
 
@@ -417,6 +427,26 @@ xcbrup learn --json design.json --mem mem0=mem0.hex --mem mem36=mem36.hex
 PASS layout model reproduces every init bit of 2 memory(s)
 ```
 
+### `fit`
+
+Fit a memory map from a routed design and the hex it was built from, for a
+geometry the plane model cannot describe. No synthesis is run.
+
+```bash
+xcbrup fit --json design.json --mem mem0=mem0.hex --output maps/name.json
+```
+
+```text
+  mem0.0.0: 512 addr x 32 bits at stride 36 base 0, 512 addr x 4 bits at stride 36 base 32
+  mem0.0.1: 512 addr x 28 bits at stride 36 base 0
+fitted map for mem0 (1024 x 32 bits, 2 RAMB18E1) -> maps/name.json
+```
+
+`--memory NAME` selects one memory when the design has several. The map is only
+written once it rebuilds every init bit of the routed JSON; a packing outside
+the family `fit` searches is refused, and the message says so. For widths up to
+18 the plane model already applies, so `fit` is not needed there.
+
 ### `patch`
 
 Rewrite memories in a routed FASM from hex files, with no synthesis.
@@ -426,9 +456,10 @@ xcbrup patch --fasm design.fasm --json design.json \
     --mem mem0=old0.hex --new-mem mem0=new0.hex --output new.fasm
 ```
 
-`--map FILE` selects a calibrated map for a geometry the plane model cannot
+`--map FILE` selects a fitted map for a geometry the plane model cannot
 describe, such as a memory inferred at width 36. The map is checked against the
-routed JSON first, and the run is refused if any init bit disagrees.
+routed JSON first, and the run is refused if any init bit disagrees, if the
+geometry differs, or if the map was fitted for a different memory.
 
 Refuses when the layout check fails, when a hex file needs a different number of
 cells than the routed design has, or when a memory cannot be located
@@ -488,7 +519,7 @@ Two things that look like problems and are not:
 Tested on `xc7s50` (Arty S7) with three designs:
 
 * `demo-projects/picosoc`: 2 x `RAMB18E1` at width 36 holding a softcore program,
-  patched through a calibrated map. The map rebuilds all 32,768 initialised bits
+  patched through a fitted map. The map rebuilds all 32,768 initialised bits
   of the routed design; patching with unchanged firmware reproduces the routed
   FASM byte for byte; an edited firmware gives contents identical to a yosys
   synthesis of the same edit, matched by content across both cells; and the

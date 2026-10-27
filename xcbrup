@@ -498,12 +498,14 @@ def encode_segments(memid, cells, path, mapping):
     rows_differ = rows != mapping["rows"]
     if rows_differ:
         raise XcbrupError(
-            f"{memid}: map {mapping['source']} describes {mapping['rows']}-row "
+            f"{memid}: map {mapping.get('source', 'given')} describes "
+            f"{mapping['rows']}-row "
             f"cells, but the design uses {rows}-row {cells[0].ctype}")
     shape_differs = depth != mapping["depth"] or width > mapping["width"]
     if shape_differs:
         raise XcbrupError(
-            f"{memid}: {path} is {depth} x {width} bits, but map {mapping['source']} "
+            f"{memid}: {path} is {depth} x {width} bits, but map "
+            f"{mapping.get('source', 'given')} "
             f"was calibrated for {mapping['depth']} x {mapping['width']} bits")
     cell_count_differs = len(cells) != len(mapping["cells"])
     if cell_count_differs:
@@ -522,7 +524,9 @@ def encode_segments(memid, cells, path, mapping):
                 word = words[address]
                 for offset in range(segment["count_bits"]):
                     bit = segment["bits"] + offset
-                    slot = segment["base"] + step * segment["stride"] + offset
+                    bit_stride = segment.get("bit_stride", 1)
+                    slot = (segment["base"] + step * segment["stride"]
+                            + offset * bit_stride)
                     value = bool((word >> bit) & 1)
                     previous = slots.setdefault(slot, value)
                     conflicting = previous != value
@@ -554,6 +558,218 @@ def encode_memory(memid, cells, path, mapping=None):
             f"{cells[0].ctype} cells, but the routed design has {len(cells)}{hint}")
     encoded = [encode_cell(i, width, depth, words, rows) for i in range(expected)]
     return encoded, width, depth, rows
+
+
+# ---------------------------------------------------------------------------
+# fitting a map from a routed design and the hex it was built from
+
+INIT_PARAM_RE = re.compile(r"^(?P<kind>INITP?)_(?P<index>[0-9A-F]{2})$")
+FIT_PROBE = [(da, dj) for da in (0, 1, 2, 5, 11) for dj in (0, 1, 3)]
+
+
+def cell_slots(params, rows):
+    """{slot: bit} of one cell, slot = row * PLANES_PER_CELL + column."""
+    slots = {}
+    for name, bit_vector in params.items():
+        found = INIT_PARAM_RE.match(name)
+        is_cell_param = found is not None
+        if not is_cell_param:
+            continue
+        index = int(found.group("index"), 16)
+        is_parity_column = found.group("kind") == "INITP"
+        for position, value in enumerate(bit_vector):
+            if is_parity_column:
+                row, column = index * 256 + position, 8
+            else:
+                row, column = index * 32 + position // 8, position % 8
+            slots[row * PLANES_PER_CELL + column] = value
+    return slots
+
+
+def addr_candidates(depth):
+    values = {0, 1}
+    for divisor in (2, 4, 8):
+        quotient = depth // divisor
+        if quotient:
+            values.add(quotient)
+    return sorted(value for value in values if value < depth)
+
+
+def stride_candidates(rows, depth, width):
+    """Strides a libmap packing can plausibly use, in increasing order."""
+    span = rows * PLANES_PER_CELL
+    values = {1, 2, 4, 8, 9, 18, 32, 36, 72, 144, 256, 288, 576, 1152, 2048, width}
+    for divisor in (depth, depth // 2):
+        if divisor:
+            quotient, remainder = divmod(span, divisor)
+            if remainder == 0:
+                values.add(quotient)
+    return sorted(value for value in values if 0 < value <= span)
+
+
+def bit_candidates(width, stride):
+    """Bit offsets a segment can start at."""
+    values = {0, 4, 8, 16}
+    spare = stride - width
+    spill_exists = 0 < spare < width
+    if spill_exists:
+        values.add(spare)
+    return sorted(value for value in values if 0 <= value < width)
+
+
+def best_segment(used, taken, words, rows, depth, width):
+    """Largest block of the form base + stride*addr + bit_stride*bit explained."""
+    span = rows * PLANES_PER_CELL
+    best = None
+    for stride in stride_candidates(rows, depth, width):
+        for bit_stride in (1, PLANES_PER_CELL):
+            for addr0 in addr_candidates(depth):
+                for bit0 in bit_candidates(width, stride):
+                    limit = min(stride + bit_stride, span)
+                    for base in range(limit):
+                        agreed = True
+                        for da, dj in FIT_PROBE:
+                            address, bit = addr0 + da, bit0 + dj
+                            inside = address < depth and bit < width
+                            if not inside:
+                                continue
+                            slot = base + stride * da + bit_stride * dj
+                            outside = slot >= span
+                            if outside or slot not in used:
+                                agreed = False
+                                break
+                            already_placed = (address, bit) in taken
+                            if already_placed:
+                                agreed = False
+                                break
+                            expected = bool((words[address] >> bit) & 1)
+                            if used[slot] != expected:
+                                agreed = False
+                                break
+                        if not agreed:
+                            continue
+                        count_bits = 0
+                        count_addr = 0
+                        while addr0 + count_addr < depth:
+                            covered = 0
+                            for dj in range(width - bit0):
+                                slot = base + stride * count_addr + bit_stride * dj
+                                if slot >= span:
+                                    break
+                                pair = (addr0 + count_addr, bit0 + dj)
+                                placed_elsewhere = pair in taken
+                                if placed_elsewhere:
+                                    break
+                                expected = bool((words[addr0 + count_addr] >> (bit0 + dj)) & 1)
+                                free = slot in used and used[slot] == expected
+                                if not free:
+                                    break
+                                covered += 1
+                            if covered == 0:
+                                break
+                            if count_addr == 0:
+                                count_bits = covered
+                            ragged = covered != count_bits
+                            if ragged:
+                                break
+                            count_addr += 1
+                        size = count_addr * count_bits
+                        previous = 0 if best is None else best["count_addr"] * best["count_bits"]
+                        if size and size > previous:
+                            best = {"addr": addr0, "bits": bit0,
+                                    "count_addr": count_addr, "count_bits": count_bits,
+                                    "base": base, "stride": stride,
+                                    "bit_stride": bit_stride}
+    return best
+
+
+def fit_segments(memid, slots, taken, words, rows, depth, width):
+    """Cover every set init bit with segments; refuse what does not fit."""
+    used = dict(slots)
+    segments = []
+    while True:
+        found = best_segment(used, taken, words, rows, depth, width)
+        if found is None:
+            unexplained = [slot for slot, value in used.items() if value]
+            if unexplained:
+                raise XcbrupError(
+                    f"{memid}: no segment of the searched family explains "
+                    f"{len(unexplained)} set init bit(s); use the plane model "
+                    "instead (no --map), or calibrate by measurement")
+            return segments
+        segments.append(found)
+        for step in range(found["count_addr"]):
+            for offset in range(found["count_bits"]):
+                taken.add((found["addr"] + step, found["bits"] + offset))
+                slot = (found["base"] + step * found["stride"]
+                        + offset * found["bit_stride"])
+                used.pop(slot, None)
+
+
+def cmd_fit(args):
+    """Fit a memory map from a routed design plus the hex it was built from."""
+    design = Design(args.json)
+    groups = group_cells(design)
+    specs = parse_mem_specs(args.mem, "--mem")
+    several = len(groups) > 1
+    if args.memory:
+        unknown = args.memory not in groups
+        if unknown:
+            raise XcbrupError(f"no memory {args.memory!r}; this design has "
+                              f"{', '.join(sorted(groups))}")
+        memid = args.memory
+    else:
+        if several:
+            raise XcbrupError(
+                f"fit one memory at a time: this design has {len(groups)} memories "
+                f"({', '.join(sorted(groups))}); pass --memory NAME")
+        memid = sorted(groups)[0]
+    missing_hex = memid not in specs
+    if missing_hex:
+        raise XcbrupError(f"no --mem given for {memid}")
+    cells = groups[memid]
+    words = read_hex(specs[memid])
+    depth, width = len(words), hex_width(words)
+    rows = ram_rows(cells[0].ctype)
+
+    fitted = []
+    taken = set()          # each (address, bit) is stored in exactly one cell
+    for cell in cells:
+        slots = cell_slots(cell.params, rows)
+        segments = fit_segments(cell.name, slots, taken, words, rows, depth, width)
+        fitted.append({"segments": segments})
+        described = ", ".join(
+            f"{s['count_addr']} addr x {s['count_bits']} bits at stride {s['stride']} "
+            f"base {s['base']}" for s in segments)
+        print(f"  {cell.name}: {described or 'no init bits'}", file=sys.stderr)
+
+    document = {
+        "version": 1,
+        "note": ("Fitted from the routed JSON and the hex the design was built from, "
+                 "then verified bit for bit against that JSON. Re-fit if the memory "
+                 "shape, the cell count or the packing changes."),
+        "cell_type": cells[0].ctype,
+        "rows": rows,
+        "depth": depth,
+        "width": width,
+        "cells": fitted,
+    }
+    binding_needed = several
+    if binding_needed:
+        document["memory"] = memid
+
+    encoded, _, _, _ = encode_segments(memid, cells, specs[memid], document)
+    for index, cell in enumerate(cells):
+        bad = params_disagreement(encoded[index], cell)
+        if bad is not None:
+            raise XcbrupError(f"{cell.name}: fitted map disagrees with the routed "
+                              f"design on {bad}; refusing to write it")
+
+    with open(args.output, "w") as handle:
+        handle.write(json.dumps(document, indent=2) + "\n")
+    print(f"fitted map for {memid} ({depth} x {width} bits, {len(cells)} "
+          f"{cells[0].ctype}) -> {args.output}")
+    return 0
 
 
 def params_disagreement(expected, cell):
@@ -817,12 +1033,25 @@ def cmd_patch(args):
     old_specs = parse_mem_specs(args.mem, "--mem")
     new_specs = parse_mem_specs(args.new_mem, "--new-mem")
     mapfile = load_map(args.map) if args.map else None
+    this_map = None
+    if mapfile is not None:
+        bound_memory = mapfile.get("memory")
+        unbound_and_several = bound_memory is None and len(groups) > 1
+        if unbound_and_several:
+            raise XcbrupError(
+                f"--map does not name a memory and the design has {len(groups)}; "
+                "fit one map per memory")
+        unknown_memory = bound_memory is not None and bound_memory not in groups
+        if unknown_memory:
+            raise XcbrupError(f"--map was fitted for {bound_memory!r}, which this "
+                              "design does not have")
+        this_map = mapfile
 
     for memid in sorted(groups):
         if memid not in old_specs or memid not in new_specs:
             raise XcbrupError(f"{memid}: needs both --mem and --new-mem")
         encoded, width, depth, rows = encode_memory(
-            memid, groups[memid], old_specs[memid], mapfile)
+            memid, groups[memid], old_specs[memid], this_map)
         for index, cell in enumerate(groups[memid]):
             bad = params_disagreement(encoded[index], cell)
             if bad is not None:
@@ -840,7 +1069,7 @@ def cmd_patch(args):
     replacements = {}
     for memid in sorted(groups):
         encoded, width, depth, rows = encode_memory(
-            memid, groups[memid], new_specs[memid], mapfile)
+            memid, groups[memid], new_specs[memid], this_map)
         for index, cell in enumerate(groups[memid]):
             replacements[cell.name] = Cell(cell.name, cell.ctype, encoded[index])
 
@@ -911,6 +1140,14 @@ def build_parser():
     p.add_argument("--json", required=True)
     p.add_argument("--mem", action="append", metavar="NAME=FILE")
     p.set_defaults(func=cmd_learn)
+
+    p = sub.add_parser("fit",
+                       help="fit a memory map from a routed design and its hex")
+    p.add_argument("--json", required=True)
+    p.add_argument("--mem", action="append", metavar="NAME=FILE")
+    p.add_argument("--memory", help="memory to fit, when the design has several")
+    p.add_argument("--output", required=True)
+    p.set_defaults(func=cmd_fit)
 
     p = sub.add_parser("patch",
                        help="update memories from hex files, without yosys")
