@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""xcbrup - update Xilinx 7-series block RAM contents without re-running nextpnr.
+
+The openXC7 flow is
+
+    yosys            -> design.json
+    nextpnr-xilinx   -> design.fasm      (slow; place + route)
+    fpga-as          -> design.bit       (fast; FASM -> frames -> bitstream)
+
+Only the memory init bits of a design change when firmware changes, and in FASM
+every one of those bits is a named feature:
+
+    BRAM_L_X6Y350.RAMB18_Y1.INIT_00[255:0] = 256'b0000...
+    BRAM_L_X6Y350.RAMB18_Y1.INITP_00[255:0] = 256'b0000...
+
+so a new bitstream only needs those features rewritten.  xcbrup takes the routed
+FASM of the design, the yosys JSON it was routed from, and a yosys JSON built
+from the new memory contents, and splices the new init bits in.
+
+Cells are located in the FASM by content: every RAMB cell carries 18432 init
+bits and its vector is compared against every RAMB18 half found in the FASM.
+Nothing about placement has to be known, and no route or constraint change is
+ever accepted -- a design whose non-INIT features differ from the routed FASM is
+rejected rather than silently mis-patched.
+
+Subcommands
+    genpat    write a pseudo-random hex file usable as a memory pattern
+    cells     list RAMB cells of a yosys JSON with their init digest
+    halves    list RAMB18 halves of a FASM file with their init digest
+    identify  match cells against FASM halves
+    update    splice new init bits into a routed FASM
+    check     rewrite a FASM file unchanged (parser round-trip test)
+
+Bit order: a yosys parameter INIT_xx is 256 bits, LSB first from the JSON string.
+The FASM feature INIT_xx[255:0] is the same 256 bits, MSB first inside the
+Verilog literal.  nextpnr splits a RAMB36E1 cell's INIT_xx/INIT_{xx+1} pair by
+bit parity into the two RAMB18 halves of its tile -- see write_bram_init() in
+nextpnr-xilinx/xilinx/fasm.cc -- and that split is reproduced here exactly.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+
+# A RAMB18 half carries 64 x INIT_xx[255:0] (data) + 8 x INITP_xx[255:0]
+# (parity): 16384 + 2048 = 18432 bits.
+N_INIT = 64
+N_INITP = 8
+INIT_BITS = N_INIT * 256
+HALF_BITS = INIT_BITS + N_INITP * 256
+
+FASM_VECTOR_RE = re.compile(r"^(?P<tile>[^.\s]+)\.(?P<feat>\S+?)\s*=\s*"
+                            r"(?P<width>\d+)'(?P<base>[bBhHdD])(?P<digits>[0-9a-fA-FxXzZ_]+)\s*$")
+FASM_SCALAR_RE = re.compile(r"^(?P<tile>[^.\s]+)\.(?P<feat>\S+?)\s*$")
+BRAM_HALF_FEATURE_RE = re.compile(r"^RAMB18_Y(?P<half>[01])\."
+                                  r"(?:(?P<kind>INITP?)_(?P<idx>[0-9A-F]{2})"
+                                  r"\[\d+:\d+\]|(?P<other>.+))$")
+RAMB_WIDTH_RE = re.compile(r"^(?:SDP_)?(?:READ|WRITE)_WIDTH_[AB]_(?P<num>\d+)$")
+
+
+class XcbrupError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# FASM
+
+class Fasm:
+    """A FASM file kept as text lines, with the RAMB init features decoded.
+
+    Every line is retained verbatim so that `emit` reproduces the input byte for
+    byte; only the lines an `update` changes are regenerated.
+    """
+
+    def __init__(self):
+        self.lines = []          # raw text, without newline
+        self.by_feature = {}     # (tile, feat) -> line index
+        self.halves = {}         # (tile, half) -> {kind+idx: bitlist LSB-first}
+        self.config = {}         # (tile, half) -> set of non-init feature names
+        self._parse()
+
+    @staticmethod
+    def _decode(width, base, digits):
+        digits = digits.replace("_", "")
+        if base in "bB":
+            bits = []
+            for ch in reversed(digits):
+                bits.append({"0": False, "1": True}.get(ch.lower(), False))
+            return bits
+        if base in "hH":
+            value = int(digits.replace("x", "0").replace("z", "0"), 16)
+            return [bool((value >> i) & 1) for i in range(width)]
+        value = int(digits.replace("x", "0").replace("z", "0"))
+        return [bool((value >> i) & 1) for i in range(width)]
+
+    def _parse(self):
+        with open(self.path_holder, "r") as handle:
+            for raw in handle:
+                line = raw.rstrip("\n")
+                self.lines.append(line)
+                index = len(self.lines) - 1
+                text = line.strip()
+                if not text or text[0] in "#{};":
+                    continue
+                match = FASM_VECTOR_RE.match(text)
+                if match:
+                    tile = match["tile"]
+                    feat = match["feat"]
+                    width = int(match["width"])
+                    bits = self._decode(width, match["base"], match["digits"])
+                    self.by_feature[(tile, feat)] = index
+                    self._note_bram(tile, feat, bits)
+                    continue
+                match = FASM_SCALAR_RE.match(text)
+                if match:
+                    self.by_feature[(match["tile"], match["feat"])] = index
+                    self._note_bram(match["tile"], match["feat"], None)
+
+    def _note_bram(self, tile, feat, bits):
+        match = BRAM_HALF_FEATURE_RE.match(feat)
+        if not match:
+            return
+        half = int(match["half"])
+        if match["kind"] in ("INIT", "INITP") and match["idx"]:
+            key = f'{match["kind"]}_{match["idx"]}'
+            self.halves.setdefault((tile, half), {})[key] = bits
+            return
+        self.config.setdefault((tile, half), set()).add(feat.split(".", 1)[1])
+
+    def half_widths(self, tile, half):
+        widths = set()
+        for feat in self.config.get((tile, half), ()):
+            match = RAMB_WIDTH_RE.match(feat)
+            if match:
+                widths.add(int(match["num"]))
+        return widths
+
+    @classmethod
+    def load(cls, path):
+        obj = cls.__new__(cls)
+        obj.path_holder = path
+        obj.lines = []
+        obj.by_feature = {}
+        obj.halves = {}
+        obj.config = {}
+        obj._parse()
+        return obj
+
+    def half_signature(self, tile, half):
+        """18432-bit digest of one RAMB18 half, or None if it holds no init bits."""
+        slot = self.halves.get((tile, half))
+        if not slot:
+            return None
+        digest = hashlib.sha256()
+        for kind, count in (("INIT", N_INIT), ("INITP", N_INITP)):
+            for i in range(count):
+                key = f"{kind}_{i:02X}"
+                bits = slot.get(key)
+                if bits is None:
+                    digest.update(b"\x00" * 32)
+                    continue
+                packed = bytearray(32)
+                for bit, is_set in enumerate(bits[:256]):
+                    if is_set:
+                        packed[bit >> 3] |= 1 << (bit & 7)
+                digest.update(bytes(packed))
+        return digest.hexdigest()
+
+    def set_half(self, tile, half, vectors):
+        """Rewrite (or insert) the INIT_xx/INITP_xx features of one RAMB18 half."""
+        for kind, count in (("INIT", N_INIT), ("INITP", N_INITP)):
+            for i in range(count):
+                key = f"{kind}_{i:02X}"
+                feat = f"RAMB18_Y{half}.{key}[255:0]"
+                bits = vectors.get(key)
+                is_empty = bits is None or not any(bits)
+                existing = self.by_feature.get((tile, feat))
+                if existing is None:
+                    if is_empty:
+                        continue
+                    self.lines.append(self._render(tile, feat, bits))
+                    self.by_feature[(tile, feat)] = len(self.lines) - 1
+                    continue
+                if is_empty and kind == "INITP":
+                    # nextpnr never emits an INITP_xx line whose bits are all
+                    # clear unless the cell carried the parameter; only rewrite
+                    # when the caller supplied something to write.
+                    if bits is None:
+                        continue
+                if bits is None:
+                    continue
+                self.lines[existing] = self._render(tile, feat, bits)
+
+    @staticmethod
+    def _render(tile, feat, bits):
+        width = len(bits)
+        digits = "".join("1" if bit else "0" for bit in reversed(bits))
+        return f"{tile}.{feat} = {width}'b{digits}"
+
+    def emit(self, path):
+        trailing = "\n"
+        with open(path, "w") as handle:
+            handle.write("\n".join(self.lines))
+            handle.write(trailing)
+
+
+# ---------------------------------------------------------------------------
+# yosys JSON
+
+def param_bits(value, width=256):
+    """Decode a yosys JSON parameter into a list of bits, LSB first."""
+    if isinstance(value, bool):
+        return [value]
+    if isinstance(value, int):
+        if value < 0:
+            value &= (1 << width) - 1
+        return [bool((value >> i) & 1) for i in range(width)] if width else \
+               [bool((value >> i) & 1) for i in range(max(1, value.bit_length()))]
+    text = str(value).strip()
+    if "'" in text:
+        text = text.split("'", 1)[1]
+    if text[:1] in ("b", "B"):
+        text = text[1:]
+    bits = []
+    for ch in reversed(text):
+        bits.append({"0": False, "1": True}.get(ch.lower(), False))
+    if width and len(bits) < width:
+        bits.extend([False] * (width - len(bits)))
+    return bits
+
+
+def bram_init_vectors(params, is36, half):
+    """Port of write_bram_init() from nextpnr-xilinx/xilinx/fasm.cc.
+
+    Returns {feature key: 256-bit list} for one RAMB18 half of a cell.  For a
+    RAMB36E1 cell the INIT_xx parameter pair is interleaved by bit parity, so
+    `half` selects even or odd bits; a RAMB18E1 cell ignores `half`.
+    """
+    out = {}
+    for mode, count in (("", N_INIT), ("P", N_INITP)):
+        for i in range(count):
+            data = [False] * 256
+            has_init = False
+            if is36:
+                for j in (0, 1):
+                    bits = params.get(f"INIT{mode}_{i * 2 + j:02X}")
+                    if bits is None:
+                        continue
+                    has_init = True
+                    for k in range(half, min(256, len(bits)), 2):
+                        data[j * 128 + k // 2] = bits[k]
+            else:
+                bits = params.get(f"INIT{mode}_{i:02X}")
+                if bits is None:
+                    continue
+                has_init = True
+                for k in range(min(256, len(bits))):
+                    data[k] = bits[k]
+            if has_init:
+                out[f"INIT{mode}_{i:02X}"] = data
+    return out
+
+
+def vectors_signature(vectors):
+    if not vectors:
+        return None
+    digest = hashlib.sha256()
+    for kind, count in (("INIT", N_INIT), ("INITP", N_INITP)):
+        for i in range(count):
+            bits = vectors.get(f"{kind}_{i:02X}")
+            if bits is None:
+                digest.update(b"\x00" * 32)
+                continue
+            packed = bytearray(32)
+            for bit, is_set in enumerate(bits[:256]):
+                if is_set:
+                    packed[bit >> 3] |= 1 << (bit & 7)
+            digest.update(bytes(packed))
+    return digest.hexdigest()
+
+
+class Cell:
+    def __init__(self, name, ctype, params):
+        self.name = name
+        self.ctype = ctype
+        self.params = params
+        self.is36 = ctype.startswith("RAMB36")
+        self.width = None
+        for port in ("READ_WIDTH_A", "WRITE_WIDTH_A", "READ_WIDTH_B", "WRITE_WIDTH_B"):
+            bits = params.get(port)
+            if bits:
+                value = 0
+                for bit, is_set in enumerate(bits):
+                    if is_set:
+                        value |= 1 << bit
+                if value:
+                    self.width = value
+                    break
+
+    def widths(self):
+        """The non-zero port widths declared by this cell."""
+        found = set()
+        for port in ("READ_WIDTH_A", "WRITE_WIDTH_A", "READ_WIDTH_B", "WRITE_WIDTH_B"):
+            bits = self.params.get(port)
+            if not bits:
+                continue
+            value = 0
+            for bit, is_set in enumerate(bits):
+                if is_set:
+                    value |= 1 << bit
+            if value:
+                found.add(value)
+        return found
+
+    def vectors(self, half):
+        return bram_init_vectors(self.params, self.is36, half)
+
+    def signature(self, half):
+        return vectors_signature(self.vectors(half))
+
+
+class Design:
+    def __init__(self, path):
+        with open(path, "r") as handle:
+            data = json.load(handle)
+        self.cells = []
+        for module in data.get("modules", {}).values():
+            for name, cell in module.get("cells", {}).items():
+                ctype = cell.get("type", "")
+                if "RAMB" not in ctype:
+                    continue
+                params = {}
+                for key, value in cell.get("parameters", {}).items():
+                    params[key] = param_bits(value, 256)
+                self.cells.append(Cell(name, ctype, params))
+        self.cells.sort(key=lambda c: c.name)
+
+
+# ---------------------------------------------------------------------------
+# matching
+
+def identify(design, fasm):
+    """Map each RAMB cell to the FASM RAMB18 half (or tile) holding its bits.
+
+    Content decides the match.  An all-zero memory is the same 18432 bits no
+    matter which tile it landed in, so ties are broken with the port widths the
+    half records, and a tie that survives that is reported as ambiguous rather
+    than guessed -- picking wrong would write firmware into an unrelated tile.
+    """
+    by_sig = {}
+    for (tile, half) in fasm.halves:
+        sig = fasm.half_signature(tile, half)
+        if sig is None:
+            continue
+        by_sig.setdefault(sig, []).append((tile, half))
+
+    matches = []       # (cell, tile, [halves])
+    ambiguous = []     # (cell, [(tile, half), ...])
+    unmatched = []     # (cell, reason)
+    used = set()
+
+    def width_compatible(cell, tile, half):
+        half_widths = fasm.half_widths(tile, half)
+        if not half_widths:
+            return True
+        # Different nextpnr-xilinx builds spell the recorded width differently --
+        # the openXC7 fork halves a RAMB36 port width per RAMB18 half, the
+        # upstream himbaechel arch records an SDP split instead -- so treat any
+        # width in the same halving/doubling family as compatible.  Contents,
+        # not widths, are what actually decides a match.
+        allowed = set()
+        for width in cell.widths():
+            allowed.update((width, width // 2, width * 2))
+        return half_widths <= allowed
+
+    for cell in design.cells:
+        if cell.is36:
+            sig0 = cell.signature(0)
+            sig1 = cell.signature(1)
+            candidates = []
+            for (tile, half) in by_sig.get(sig0, []):
+                other = 1 - half
+                if (tile, half) in used or (tile, other) in used:
+                    continue
+                if fasm.half_signature(tile, other) != sig1:
+                    continue
+                if not width_compatible(cell, tile, half):
+                    continue
+                candidates.append((tile, [half, other]))
+        else:
+            sig = cell.signature(0)
+            candidates = [(tile, [half]) for (tile, half) in by_sig.get(sig, [])
+                          if (tile, half) not in used
+                          and width_compatible(cell, tile, half)]
+
+        if not candidates:
+            unmatched.append((cell, "no RAMB18 half with matching init bits"))
+            continue
+        if len(candidates) > 1:
+            ambiguous.append((cell, candidates))
+            continue
+        tile, halves = candidates[0]
+        for half in halves:
+            used.add((tile, half))
+        matches.append((cell, tile, halves))
+    return matches, ambiguous, unmatched
+
+
+def apply_update(fasm, design, mapping):
+    """Rewrite the FASM init features of every mapped cell from `design`."""
+    for cell, tile, halves in mapping:
+        if cell.is36:
+            fasm.set_half(tile, halves[0], cell.vectors(halves[0]))
+            fasm.set_half(tile, halves[1], cell.vectors(halves[1]))
+        else:
+            half = halves[0]
+            fasm.set_half(tile, half, cell.vectors(half))
+
+
+# ---------------------------------------------------------------------------
+# commands
+
+def cmd_genpat(args):
+    rng = random.Random(args.seed)
+    words = max(1, (args.width + 31) // 32)
+    digits = words * 8
+    with open(args.output, "w") as handle:
+        for _ in range(args.count):
+            value = rng.getrandbits(digits * 4)
+            value &= (1 << args.width) - 1
+            handle.write(f"{value:0{digits}x}\n")
+    return 0
+
+
+def cmd_cells(args):
+    design = Design(args.json)
+    for cell in design.cells:
+        halves = [0, 1] if cell.is36 else [0]
+        digests = " ".join((cell.signature(h) or "-")[:16] for h in halves)
+        width = f"{cell.width:>2}" if cell.width else " ?"
+        print(f"{cell.name:<40} {cell.ctype:<10} w={width} {digests}")
+    print(f"# {len(design.cells)} RAMB cells", file=sys.stderr)
+    return 0
+
+
+def cmd_halves(args):
+    fasm = Fasm.load(args.fasm)
+    for (tile, half) in sorted(fasm.halves):
+        digest = fasm.half_signature(tile, half) or "-"
+        print(f"{tile:<20} RAMB18_Y{half} {len(fasm.halves[(tile, half)]):>2} features {digest[:16]}")
+    print(f"# {len(fasm.halves)} RAMB18 halves", file=sys.stderr)
+    return 0
+
+
+def cmd_identify(args):
+    fasm = Fasm.load(args.fasm)
+    design = Design(args.json)
+    matches, ambiguous, unmatched = identify(design, fasm)
+    for cell, tile, halves in matches:
+        half_text = ",".join(f"Y{h}" for h in halves)
+        print(f"{cell.name} -> {tile}.RAMB18_{half_text}")
+    for cell, candidates in ambiguous:
+        where = ", ".join(f"{t}.RAMB18_Y{h}" for t, h in candidates[:4])
+        print(f"AMBIGUOUS {cell.name} ({cell.ctype}): {len(candidates)} halves hold "
+              f"identical bits ({where}{' ...' if len(candidates) > 4 else ''})",
+              file=sys.stderr)
+    for cell, reason in unmatched:
+        print(f"UNMATCHED {cell.name} ({cell.ctype}): {reason}", file=sys.stderr)
+    print(f"# matched {len(matches)}/{len(design.cells)} cells, "
+          f"{len(ambiguous)} ambiguous, {len(unmatched)} unmatched", file=sys.stderr)
+    if unmatched or ambiguous:
+        return 1
+    if args.map:
+        with open(args.map, "w") as handle:
+            json.dump([{"cell": c.name, "tile": t, "halves": h} for c, t, h in matches],
+                      handle, indent=1)
+    return 0
+
+
+def cmd_check(args):
+    fasm = Fasm.load(args.fasm)
+    tmp = args.output
+    fasm.emit(tmp)
+    with open(args.fasm, "rb") as a, open(tmp, "rb") as b:
+        if a.read() != b.read():
+            print("MISMATCH: rewritten FASM differs from input", file=sys.stderr)
+            return 1
+    print("ok: FASM round-trip is byte identical")
+    if args.cleanup:
+        os.unlink(tmp)
+    return 0
+
+
+def cmd_update(args):
+    fasm = Fasm.load(args.fasm)
+    old = Design(args.old_json)
+    matches, ambiguous, unmatched = identify(old, fasm)
+    if unmatched:
+        for cell, reason in unmatched:
+            print(f"UNMATCHED {cell.name}: {reason}", file=sys.stderr)
+        raise XcbrupError("cannot place every RAMB cell of the routed design; "
+                          "refusing to patch")
+    if len(matches) + len(ambiguous) != len(old.cells):
+        raise XcbrupError("incomplete cell placement")
+
+    new = Design(args.new_json)
+    if len(new.cells) != len(old.cells):
+        raise XcbrupError("RAMB cell count changed between runs; the memory "
+                          "footprint changed, a full nextpnr run is needed")
+    new_by_name = {cell.name: cell for cell in new.cells}
+
+    placed = {cell.name: (tile, halves) for cell, tile, halves in matches}
+    ambiguous_by_name = {cell.name: candidates for cell, candidates in ambiguous}
+
+    mapping = []
+    skipped = []
+    for old_cell in old.cells:
+        if old_cell.name not in new_by_name:
+            raise XcbrupError(f"cell {old_cell.name} disappeared; the netlist "
+                              "changed, a full nextpnr run is needed")
+        new_cell = new_by_name[old_cell.name]
+        if old_cell.is36 != new_cell.is36:
+            raise XcbrupError(f"cell {old_cell.name} changed type "
+                              f"{old_cell.ctype} -> {new_cell.ctype}; a full run is needed")
+        if old_cell.widths() != new_cell.widths():
+            raise XcbrupError(f"cell {old_cell.name} changed port widths; a full run "
+                              "is needed")
+
+        if old_cell.name in placed:
+            tile, halves = placed[old_cell.name]
+            mapping.append((new_cell, tile, halves))
+            continue
+
+        # Ambiguous: several tiles hold bit-identical init data.  Writing is
+        # only safe when there is nothing to write.
+        halves = [0, 1] if new_cell.is36 else [0]
+        if any(any(bits) for half in halves for bits in new_cell.vectors(half).values()):
+            candidates = ambiguous_by_name[old_cell.name]
+            where = ", ".join(f"{t}.RAMB18_Y{h}" for t, h in candidates[:4])
+            raise XcbrupError(
+                f"cell {old_cell.name} is ambiguous ({len(candidates)} candidate halves: "
+                f"{where}) and the new contents are not all zero; give the memory "
+                "non-zero contents in the routed design so it can be located")
+        skipped.append(old_cell.name)
+
+    apply_update(fasm, new, mapping)
+    fasm.emit(args.output)
+    print(f"patched {len(mapping)} RAMB cells -> {args.output}", file=sys.stderr)
+    if skipped:
+        print(f"skipped {len(skipped)} zero-content cell(s): {', '.join(skipped)}",
+              file=sys.stderr)
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="xcbrup", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("genpat", help="write a pseudo-random hex memory pattern")
+    p.add_argument("--output", required=True)
+    p.add_argument("--width", type=int, required=True)
+    p.add_argument("--count", type=int, required=True)
+    p.add_argument("--seed", type=int, default=1)
+    p.set_defaults(func=cmd_genpat)
+
+    p = sub.add_parser("cells", help="list RAMB cells of a yosys JSON")
+    p.add_argument("--json", required=True)
+    p.set_defaults(func=cmd_cells)
+
+    p = sub.add_parser("halves", help="list RAMB18 halves of a FASM file")
+    p.add_argument("--fasm", required=True)
+    p.set_defaults(func=cmd_halves)
+
+    p = sub.add_parser("identify", help="match RAMB cells to FASM halves")
+    p.add_argument("--fasm", required=True)
+    p.add_argument("--json", required=True)
+    p.add_argument("--map")
+    p.set_defaults(func=cmd_identify)
+
+    p = sub.add_parser("update", help="splice new init bits into a routed FASM")
+    p.add_argument("--fasm", required=True)
+    p.add_argument("--old-json", required=True)
+    p.add_argument("--new-json", required=True)
+    p.add_argument("--output", required=True)
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("check", help="rewrite a FASM unchanged (round-trip test)")
+    p.add_argument("--fasm", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--cleanup", action="store_true")
+    p.set_defaults(func=cmd_check)
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except XcbrupError as error:
+        print(f"xcbrup: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
